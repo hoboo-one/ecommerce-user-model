@@ -1,0 +1,222 @@
+# -*- coding: utf-8 -*-
+"""
+LightGBM 回归：预测用户总消费金额（order_amount）
+
+输出：
+- MAE、RMSE、R^2
+- MAPE（仅在真实金额 > 0 的样本上计算，避免被 0 冲爆）
+- 误差在 20%、30% 以内样本占比（只在真实金额 > 0 的样本上）
+- 将预测结果保存到桌面 CSV：真实值、预测值、绝对误差、相对误差（%）
+- 中文可视化图：特征重要性、预测 vs 真实、残差分布
+
+你主要需要改两处：
+1）input_path：原始 CSV 路径
+2）feature_cols：用于 LightGBM 的特征（不要包含 order_amount）
+"""
+
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import matplotlib.pyplot as plt
+
+# ===== 让 matplotlib 支持中文显示 =====
+plt.rcParams['font.sans-serif'] = ['SimHei']   # 使用黑体显示中文
+plt.rcParams['axes.unicode_minus'] = False     # 正常显示负号
+
+# ===== LightGBM 模型 =====
+try:
+    from lightgbm import LGBMRegressor
+except ImportError:
+    raise ImportError("请先安装 lightgbm 库：pip install lightgbm")
+
+# ========== 1. 路径配置 ==========
+# 原始数据路径（你给的路径）
+input_path = r'C:\Users\19036\Desktop\ecommerce_user_behavior_1000rows.csv'
+# 预测结果输出到桌面
+pred_output_path = r'C:\Users\19036\Desktop\ecommerce_lgbm_predictions.csv'
+
+# ========== 2. 读取原始数据 ==========
+df = pd.read_csv(input_path)
+
+print("原始数据形状:", df.shape)
+print("列名:", df.columns.tolist())
+
+# ========== 3. 按 user_id 聚合到“用户层级” ==========
+agg_dict = {
+    "age": "first",
+    "gender": "first",
+    "membership_level": "first",
+    "days_since_last_login": "min",
+    "total_orders": "max",
+    "browse_duration": "sum",
+    "page_views": "sum",
+    "products_viewed": "sum",
+    "cart_additions": "sum",
+    "wishlist_additions": "sum",
+    "search_queries": "sum",
+    "order_amount": "sum",            # 作为预测目标
+    "used_coupon": "sum",
+    "discount_rate": "mean",
+    "product_price": "mean",
+    "product_rating": "mean",
+}
+
+agg_dict_existing = {k: v for k, v in agg_dict.items() if k in df.columns}
+
+user_df = (
+    df.groupby("user_id")
+      .agg(agg_dict_existing)
+      .reset_index()
+)
+
+print("聚合后用户层级数据形状:", user_df.shape)
+
+if "order_amount" not in user_df.columns:
+    raise ValueError("聚合后的数据中没有 'order_amount' 列，无法作为预测目标。")
+
+# ========== 4. 选择用于 LightGBM 的特征 ==========
+# !!! 以后你只要改这个列表，就能换一批特征来建模 !!!
+# 注意：不要把 order_amount 自己放进去
+feature_cols = [
+    "total_orders",          # 历史订单数
+    "days_since_last_login", # 最近登录天数
+    "browse_duration",       # 浏览时长
+    "page_views",            # 浏览页数
+    "cart_additions",        # 加购次数
+    "used_coupon",           # 使用优惠券次数
+    "discount_rate",         # 平均折扣力度
+    "product_price",         # 平均商品价格
+    "product_rating",        # 平均商品评分
+]
+
+feature_cols = [c for c in feature_cols if c in user_df.columns]
+
+if not feature_cols:
+    raise ValueError("feature_cols 中的列在数据里都不存在，请检查列名。")
+
+print("用于 LightGBM 回归的特征列:", feature_cols)
+
+X = user_df[feature_cols].copy().fillna(0)
+y = user_df["order_amount"].values
+user_ids = user_df["user_id"].values  # 保存 user_id 方便导出预测结果
+
+# ========== 5. 划分训练集 / 测试集（连 user_id 一起划分） ==========
+X_train, X_test, y_train, y_test, id_train, id_test = train_test_split(
+    X, y, user_ids, test_size=0.2, random_state=42
+)
+
+# ========== 6. 训练 LightGBM 回归模型 ==========
+lgb_model = LGBMRegressor(
+    n_estimators=500,
+    learning_rate=0.05,
+    num_leaves=31,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    random_state=42
+)
+
+lgb_model.fit(X_train, y_train)
+
+# ========== 7. 预测 & 评估 ==========
+y_pred = lgb_model.predict(X_test)
+
+# 7.1 常规误差指标
+mae = mean_absolute_error(y_test, y_pred)
+mse = mean_squared_error(y_test, y_pred)  # 旧版 sklearn 没 squared 参数
+rmse = mse ** 0.5
+r2 = r2_score(y_test, y_pred)
+
+# 7.2 百分比误差（只在真实金额 > 0 的样本上计算，避免 0 冲爆）
+mask_pos = y_test > 0   # 真实金额 > 0 的样本
+if np.any(mask_pos):
+    abs_err_pos = np.abs(y_test[mask_pos] - y_pred[mask_pos])
+    relative_error_pos = abs_err_pos / np.abs(y_test[mask_pos])
+    mape = np.mean(relative_error_pos) * 100
+    acc_20 = np.mean(relative_error_pos <= 0.20) * 100
+    acc_30 = np.mean(relative_error_pos <= 0.30) * 100
+else:
+    mape = np.nan
+    acc_20 = np.nan
+    acc_30 = np.nan
+
+print("\n=== LightGBM：预测用户总消费金额（order_amount） ===")
+print("使用特征:", feature_cols)
+print(f"MAE  : {mae:.2f}")
+print(f"RMSE : {rmse:.2f}")
+print(f"R^2  : {r2:.4f}")
+if not np.isnan(mape):
+    print(f"MAPE（仅统计真实金额>0的样本）: {mape:.2f}%")
+    print(f"相对误差 ≤ 20% 的样本占比: {acc_20:.2f}%")
+    print(f"相对误差 ≤ 30% 的样本占比: {acc_30:.2f}%")
+else:
+    print("MAPE 无法计算（测试集中真实金额全为 0）。")
+
+# ========== 8. 特征重要性 ==========
+fi = pd.DataFrame({
+    "feature": feature_cols,
+    "importance": lgb_model.feature_importances_
+}).sort_values("importance", ascending=False)
+
+print("\n特征重要性（从高到低）:")
+print(fi)
+
+# ========== 9. 将预测结果保存到桌面 CSV ==========
+# 包含：user_id、真实值、预测值、绝对误差、相对误差（%）
+abs_error_all = np.abs(y_test - y_pred)
+
+# 安全计算相对误差：只在真实值 != 0 的地方做除法，其他地方记为 NaN
+denom = np.abs(y_test)
+relative_error_all = np.empty_like(y_test, dtype=float)
+relative_error_all[:] = np.nan  # 先全部设为 NaN
+
+mask_nonzero = denom > 0
+relative_error_all[mask_nonzero] = (
+    abs_error_all[mask_nonzero] / denom[mask_nonzero] * 100.0
+)
+
+pred_df = pd.DataFrame({
+    "user_id": id_test,
+    "true_order_amount": y_test,
+    "pred_order_amount": y_pred,
+    "abs_error": abs_error_all,
+    "relative_error_percent": relative_error_all
+})
+
+pred_df.to_csv(pred_output_path, index=False, encoding="utf-8-sig")
+print(f"\n预测结果已保存到：{pred_output_path}")
+print(pred_df.head())
+
+# ========== 10. 可视化（中文） ==========
+
+# 10.1 特征重要性条形图
+plt.figure()
+plt.bar(fi["feature"], fi["importance"])
+plt.xticks(rotation=45, ha="right")
+plt.title("LightGBM：预测总消费金额的特征重要性")
+plt.ylabel("重要性")
+plt.tight_layout()
+
+# 10.2 预测值 vs 真实值散点图
+plt.figure()
+plt.scatter(y_test, y_pred, alpha=0.7)
+plt.xlabel("真实总消费金额")
+plt.ylabel("预测总消费金额")
+plt.title("LightGBM：预测值与真实值对比（总消费金额）")
+
+min_val = min(y_test.min(), y_pred.min())
+max_val = max(y_test.max(), y_pred.max())
+plt.plot([min_val, max_val], [min_val, max_val])  # y=x 参考线
+plt.tight_layout()
+
+# 10.3 残差直方图
+residuals = y_test - y_pred
+
+plt.figure()
+plt.hist(residuals, bins=30)
+plt.title("LightGBM：残差分布（真实值 - 预测值）")
+plt.xlabel("残差")
+plt.ylabel("样本数")
+plt.tight_layout()
+
+plt.show()
